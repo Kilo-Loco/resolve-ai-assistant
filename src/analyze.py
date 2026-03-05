@@ -39,7 +39,7 @@ def get_marker_color(marker_type: MarkerType) -> str:
     return colors.get(marker_type, "Yellow")
 
 
-def analyze_transcript(transcript, options: dict) -> List[EditMarker]:
+def analyze_transcript(transcript, options: dict, max_retries: int = 3) -> List[EditMarker]:
     """
     Analyze transcript using Claude to identify edit points.
     
@@ -49,30 +49,61 @@ def analyze_transcript(transcript, options: dict) -> List[EditMarker]:
             - add_highlights: bool
             - mark_dead_air: bool  
             - find_shorts: bool
+        max_retries: Number of retries on API failure
     
     Returns:
         List of EditMarker objects
     """
-    from anthropic import Anthropic
+    from anthropic import Anthropic, APIError, APIConnectionError, RateLimitError
+    import time
     
     client = Anthropic()
     
     # Build the analysis prompt
     prompt = build_analysis_prompt(transcript, options)
     
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # Parse the response
+            content = response.content[0].text
+            markers = parse_analysis_response(content)
+            
+            return markers
+            
+        except RateLimitError as e:
+            last_error = e
+            wait_time = (attempt + 1) * 30  # 30s, 60s, 90s
+            print(f"Rate limited, waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+            
+        except APIConnectionError as e:
+            last_error = e
+            wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+            print(f"Connection error, waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+            
+        except APIError as e:
+            last_error = e
+            print(f"API error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+            
+        except Exception as e:
+            last_error = e
+            print(f"Unexpected error: {e}")
+            break
     
-    # Parse the response
-    content = response.content[0].text
-    markers = parse_analysis_response(content)
-    
-    return markers
+    # All retries failed
+    raise RuntimeError(f"Analysis failed after {max_retries} attempts: {last_error}")
 
 
 def build_analysis_prompt(transcript, options: dict) -> str:

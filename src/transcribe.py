@@ -9,7 +9,7 @@ import tempfile
 import subprocess
 import json
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 
 @dataclass
@@ -61,42 +61,98 @@ def parse_timestamp(ts: str) -> float:
         return float(parts[0])
 
 
+def get_all_media_paths(timeline) -> List[str]:
+    """
+    Get paths to all media files in the timeline.
+    Handles multi-track, multi-clip timelines.
+    """
+    media_paths = []
+    seen_paths = set()
+    
+    # Check all video tracks
+    track_count = timeline.GetTrackCount("video")
+    for track_idx in range(1, track_count + 1):
+        items = timeline.GetItemListInTrack("video", track_idx)
+        if items:
+            for clip in items:
+                media_item = clip.GetMediaPoolItem()
+                if media_item:
+                    props = media_item.GetClipProperty()
+                    file_path = props.get("File Path", "")
+                    if file_path and file_path not in seen_paths and os.path.exists(file_path):
+                        media_paths.append(file_path)
+                        seen_paths.add(file_path)
+    
+    # Also check audio tracks
+    audio_track_count = timeline.GetTrackCount("audio")
+    for track_idx in range(1, audio_track_count + 1):
+        items = timeline.GetItemListInTrack("audio", track_idx)
+        if items:
+            for clip in items:
+                media_item = clip.GetMediaPoolItem()
+                if media_item:
+                    props = media_item.GetClipProperty()
+                    file_path = props.get("File Path", "")
+                    if file_path and file_path not in seen_paths and os.path.exists(file_path):
+                        media_paths.append(file_path)
+                        seen_paths.add(file_path)
+    
+    return media_paths
+
+
 def extract_audio_from_timeline(timeline, output_path: str) -> str:
     """
     Extract audio from a DaVinci Resolve timeline.
+    Handles multiple clips by concatenating audio.
     Returns path to the extracted audio file.
     """
-    # Get the first video item to find the media path
-    video_track = timeline.GetItemListInTrack("video", 1)
-    if not video_track:
-        raise ValueError("No video items in timeline")
+    media_paths = get_all_media_paths(timeline)
     
-    first_clip = video_track[0]
-    media_pool_item = first_clip.GetMediaPoolItem()
+    if not media_paths:
+        raise ValueError("No media files found in timeline")
     
-    if not media_pool_item:
-        raise ValueError("Could not get media pool item")
+    if len(media_paths) == 1:
+        # Single file - simple extraction
+        return extract_audio_from_file(media_paths[0], output_path)
     
-    clip_info = media_pool_item.GetClipProperty()
-    file_path = clip_info.get("File Path", "")
-    
-    if not file_path or not os.path.exists(file_path):
-        raise ValueError(f"Media file not found: {file_path}")
-    
-    # Extract audio using ffmpeg
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", file_path,
-        "-vn",  # no video
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",  # 16kHz for Whisper
-        "-ac", "1",  # mono
-        output_path
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg error: {result.stderr}")
+    # Multiple files - need to concatenate
+    # Create temp files for each, then concat
+    temp_files = []
+    try:
+        for i, path in enumerate(media_paths):
+            temp_audio = output_path.replace(".wav", f"_part{i}.wav")
+            extract_audio_from_file(path, temp_audio)
+            temp_files.append(temp_audio)
+        
+        # Concatenate with ffmpeg
+        concat_file = output_path.replace(".wav", "_concat.txt")
+        with open(concat_file, "w") as f:
+            for tf in temp_files:
+                f.write(f"file '{tf}'\n")
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_file,
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat error: {result.stderr}")
+        
+        # Cleanup concat file
+        os.unlink(concat_file)
+        
+    finally:
+        # Cleanup temp audio files
+        for tf in temp_files:
+            if os.path.exists(tf):
+                os.unlink(tf)
     
     return output_path
 
@@ -120,21 +176,33 @@ def extract_audio_from_file(video_path: str, output_path: str) -> str:
     return output_path
 
 
-def transcribe_audio(audio_path: str, model_name: str = "base") -> Transcript:
+def transcribe_audio(audio_path: str, model_name: str = "base",
+                     progress_callback: Optional[Callable[[int, str], None]] = None) -> Transcript:
     """
     Transcribe audio file using Whisper.
     
     Args:
         audio_path: Path to audio file (wav, mp3, etc.)
         model_name: Whisper model to use (tiny, base, small, medium, large)
+        progress_callback: Optional callback(percent, status) for progress updates
     
     Returns:
         Transcript object with segments and timestamps
     """
     import whisper
     
+    if progress_callback:
+        progress_callback(5, f"Loading Whisper {model_name} model...")
+    
     model = whisper.load_model(model_name)
+    
+    if progress_callback:
+        progress_callback(15, "Transcribing audio (this may take a while)...")
+    
     result = model.transcribe(audio_path, word_timestamps=True)
+    
+    if progress_callback:
+        progress_callback(95, "Processing transcript...")
     
     segments = []
     for seg in result["segments"]:
@@ -154,13 +222,15 @@ def transcribe_audio(audio_path: str, model_name: str = "base") -> Transcript:
     )
 
 
-def transcribe_timeline_audio(timeline, model_name: str = "base") -> Transcript:
+def transcribe_timeline_audio(timeline, model_name: str = "base",
+                              progress_callback: Optional[Callable[[int, str], None]] = None) -> Transcript:
     """
     Transcribe audio from a DaVinci Resolve timeline.
     
     Args:
         timeline: DaVinci Resolve Timeline object
         model_name: Whisper model to use
+        progress_callback: Optional callback for progress updates
     
     Returns:
         Transcript object
@@ -169,20 +239,26 @@ def transcribe_timeline_audio(timeline, model_name: str = "base") -> Transcript:
         audio_path = tmp.name
     
     try:
+        if progress_callback:
+            progress_callback(0, "Extracting audio from timeline...")
+        
         extract_audio_from_timeline(timeline, audio_path)
-        return transcribe_audio(audio_path, model_name)
+        
+        return transcribe_audio(audio_path, model_name, progress_callback)
     finally:
         if os.path.exists(audio_path):
             os.unlink(audio_path)
 
 
-def transcribe_video_file(video_path: str, model_name: str = "base") -> Transcript:
+def transcribe_video_file(video_path: str, model_name: str = "base",
+                          progress_callback: Optional[Callable[[int, str], None]] = None) -> Transcript:
     """
     Transcribe audio from a video file.
     
     Args:
         video_path: Path to video file
         model_name: Whisper model to use
+        progress_callback: Optional callback for progress updates
     
     Returns:
         Transcript object
@@ -191,8 +267,12 @@ def transcribe_video_file(video_path: str, model_name: str = "base") -> Transcri
         audio_path = tmp.name
     
     try:
+        if progress_callback:
+            progress_callback(0, "Extracting audio...")
+        
         extract_audio_from_file(video_path, audio_path)
-        return transcribe_audio(audio_path, model_name)
+        
+        return transcribe_audio(audio_path, model_name, progress_callback)
     finally:
         if os.path.exists(audio_path):
             os.unlink(audio_path)
@@ -204,5 +284,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         video = sys.argv[1]
         print(f"Transcribing: {video}")
-        transcript = transcribe_video_file(video)
+        
+        def progress(pct, status):
+            print(f"  [{pct}%] {status}")
+        
+        transcript = transcribe_video_file(video, progress_callback=progress)
         print(transcript.to_timestamped_text())
